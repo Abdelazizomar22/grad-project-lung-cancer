@@ -171,28 +171,70 @@ def process_image(image_data, target_size):
     image = image.convert("RGB")
     return np.expand_dims(np.array(image), axis=0)
 
+def build_resnet_model():
+    """Reconstructs the ResNet50 architecture to bypass deserialization errors."""
+    try:
+        base_model = tf.keras.applications.ResNet50(
+            include_top=False, 
+            weights=None, 
+            input_shape=(224, 224, 3),
+            pooling='avg'
+        )
+        base_model._name = "resnet50"
+        
+        model = tf.keras.Sequential([
+            base_model,
+            tf.keras.layers.Dropout(0.5, name="dropout"),
+            tf.keras.layers.Flatten(name="flatten"),
+            tf.keras.layers.BatchNormalization(name="batch_normalization"),
+            tf.keras.layers.Dropout(0.5, name="dropout_1"),
+            tf.keras.layers.Dense(4, activation='softmax', name="dense") # 4 Classes
+        ], name="resnet_sequential")
+        
+        model.build((None, 224, 224, 3))
+        return model
+    except Exception as e:
+        return None
+
 def predict_sequentially(uploaded_file, model_configs):
     """Loads one model, predicts, clears memory, loads next."""
     results = {}
-    classes = ['Benign', 'Malignant', 'Normal']
+    
+    # Class Mappings
+    # ResNet (4 classes): Adenocarcinoma, Large cell carcinoma, Normal, Squamous cell carcinoma
+    resnet_classes = ['Adenocarcinoma', 'Large cell carcinoma', 'Normal', 'Squamous cell carcinoma']
+    
+    # Severity (3 classes): Benign, Malignant, Normal
+    severity_classes = ['Benign', 'Malignant', 'Normal']
     
     img = Image.open(uploaded_file)
 
-    # 1. ResNet50
+    # 1. ResNet50 (Visual Detection)
     st.toast("Running Visual Detection Engine...", icon="🔍")
     tf.keras.backend.clear_session()
     gc.collect()
     
     try:
-        model = tf.keras.models.load_model(model_configs["ResNet50"]["path"], compile=False)
+        # Build empty model structure
+        model = build_resnet_model()
+        if model is None:
+             raise Exception("Failed to reconstruct ResNet architecture.")
+             
+        # Load weights
+        model.load_weights(model_configs["ResNet50"]["path"], skip_mismatch=True)
+        
         input_data = process_image(img, (224, 224))
         pred = model.predict(input_data)
         score = tf.nn.softmax(pred[0])
         idx = np.argmax(score)
+        
+        label = resnet_classes[idx]
+        
         results["ResNet50"] = {
-            "label": classes[idx],
+            "label": label,
             "conf": 100 * np.max(score),
             "scores": score,
+            "classes": resnet_classes,
             "success": True
         }
         del model
@@ -203,19 +245,25 @@ def predict_sequentially(uploaded_file, model_configs):
     tf.keras.backend.clear_session()
     gc.collect()
 
-    # 2. Severity
+    # 2. Severity (Severity Analysis)
     st.toast("Running Severity Analysis Engine...", icon="⚖️")
     
     try:
+        # Load H5 model directly
         model = tf.keras.models.load_model(model_configs["Severity"]["path"], compile=False)
+        
         input_data = process_image(img, (256, 256))
         pred = model.predict(input_data)
         score = tf.nn.softmax(pred[0])
         idx = np.argmax(score)
+        
+        label = severity_classes[idx]
+        
         results["Severity"] = {
-            "label": classes[idx],
+            "label": label,
             "conf": 100 * np.max(score),
             "scores": score,
+            "classes": severity_classes,
             "success": True
         }
         del model
@@ -241,96 +289,125 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# 2. Upload Section (Show only if no file is uploaded or if we are not in result mode)
-if 'result_mode' not in st.session_state:
-    st.session_state.result_mode = False
+# 2. Upload Section
+col_spacer1, col_up, col_spacer2 = st.columns([1, 2, 1])
+with col_up:
+    uploaded_file = st.file_uploader("Upload Chest CT Scan for Analysis", type=["jpg", "png", "jpeg"])
 
-if not st.session_state.result_mode:
-    col_spacer1, col_up, col_spacer2 = st.columns([1, 2, 1])
-    with col_up:
-        uploaded_file = st.file_uploader("Upload Chest CT Scan for Analysis", type=["jpg", "png", "jpeg"])
-        
-    if uploaded_file:
-        st.session_state.uploaded_file = uploaded_file
-        st.session_state.result_mode = True
-        st.rerun()
-
-# 3. Analysis & Results Section
-if st.session_state.result_mode and 'uploaded_file' in st.session_state:
-    uploaded_file = st.session_state.uploaded_file
+# 3. Analysis Section
+if uploaded_file:
+    st.markdown("---")
     
-    # We use a container for the white card effect
-    with st.container():
-        st.markdown('<div class="results-container">', unsafe_allow_html=True)
-        
-        # New 2-Column Layout
-        col_img, col_info = st.columns([1.2, 1.5], gap="large")
-        
-        with col_img:
-            st.markdown('<div class="status-badge">✅ Analysis Completed</div>', unsafe_allow_html=True)
-            st.image(uploaded_file, use_column_width=True, channels="RGB")
-            st.markdown('<p style="text-align:center; color:#888; font-size:0.8rem; margin-top:5px;">Input Scan Source</p>', unsafe_allow_html=True)
+    col_img, col_res = st.columns([1, 1.5], gap="large")
+    
+    with col_img:
+        st.markdown('<div class="content-card">', unsafe_allow_html=True)
+        st.write("#### 📷 Input Scan")
+        st.image(uploaded_file, use_column_width=True, caption="Source Image")
+        st.markdown('</div>', unsafe_allow_html=True)
 
-        with col_info:
-            configs = check_and_download_models()
-            
-            # Run or retrieve results (simple caching mechanism could be added here, but we run for demo)
-            if 'prediction_results' not in st.session_state:
-                 with st.spinner("🧠 Processing Scan..."):
-                    st.session_state.prediction_results = predict_sequentially(uploaded_file, configs)
-            
-            results = st.session_state.prediction_results
+    with col_res:
+        configs = check_and_download_models()
+        
+        with st.spinner("🧠 Initializing Multi-Stage Analysis..."):
+            # Run Sequential Prediction
+            results = predict_sequentially(uploaded_file, configs)
             
             if results["ResNet50"]["success"] and results["Severity"]["success"]:
                 r_res = results["ResNet50"]
                 r_sev = results["Severity"]
                 
-                # Determine colors based on malignancy
-                is_malignant_res = "Malignant" in r_res["label"]
-                is_malignant_sev = "Malignant" in r_sev["label"]
+                # --- CONSENSUS LOGIC ---
+                # Check Malignancy Map
+                # ResNet Classes: ['Adenocarcinoma', 'Large cell carcinoma', 'Normal', 'Squamous cell carcinoma']
+                res_is_malignant = r_res["label"] in ['Adenocarcinoma', 'Large cell carcinoma', 'Squamous cell carcinoma']
+                res_is_benign = False # ResNet doesn't output Benign explicitly
+                res_is_normal = r_res["label"] == 'Normal'
                 
-                res_color_class = "diagnosis-value-red" if is_malignant_res else "diagnosis-value-green"
-                sev_color_class = "diagnosis-value-red" if is_malignant_sev else "diagnosis-value-green"
+                # Severity Classes: ['Benign', 'Malignant', 'Normal']
+                sev_is_malignant = r_sev["label"] == 'Malignant'
+                sev_is_benign = r_sev["label"] == 'Benign'
+                sev_is_normal = r_sev["label"] == 'Normal'
+                
+                final_status = "Unknown"
+                if res_is_malignant or sev_is_malignant:
+                    final_status = "MALIGNANT DETECTED"
+                    final_color = "#c62828" # Red
+                    icon = "🚨"
+                elif sev_is_benign:
+                    final_status = "BENIGN DETECTED"
+                    final_color = "#f57f17" # Orange
+                    icon = "⚠️"
+                elif res_is_normal and sev_is_normal:
+                    final_status = "NORMAL / HEALTHY"
+                    final_color = "#2e7d32" # Green
+                    icon = "✅"
+                else:
+                    # Fallback / Mixed
+                    final_status = "INCONCLUSIVE / CHECK"
+                    final_color = "#888"
+                    icon = "❓"
 
-                # -- Title --
-                st.markdown('<div class="diagnosis-header">Diagnosis Result</div>', unsafe_allow_html=True)
+                avg_conf = (r_res["conf"] + r_sev["conf"]) / 2
+
+                # 1. Consensus Box
+                st.markdown(f"""
+                <div class="consensus-box" style="background: linear-gradient(135deg, {final_color} 0%, #333 100%);">
+                    <div class="consensus-title">AI Consolidated Diagnosis</div>
+                    <div class="consensus-result">{icon} {final_status}</div>
+                    <div style="font-size:0.9rem; opacity:0.8;">Average Confidence: {avg_conf:.1f}%</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+                # 2. Detailed Breakdown
+                c1, c2 = st.columns(2)
                 
-                # -- Prediction 1 --
-                st.markdown('<div class="diagnosis-label">PREDICTED TYPE:</div>', unsafe_allow_html=True)
-                st.markdown(f'<div class="{res_color_class}">{r_res["label"]} ({r_res["conf"]:.2f}%)</div>', unsafe_allow_html=True)
+                # Colors for individual cards
+                res_color_class = "diagnosis-value-red" if res_is_malignant else ("diagnosis-value-green" if res_is_normal else "diagnosis-value-green") # Default green for others?? No, keep logical
+                if res_is_malignant: res_css = "color:#c62828;" 
+                elif res_is_normal: res_css = "color:#2e7d32;"
+                else: res_css = "color:#333;"
                 
-                # -- Prediction 2 --
-                st.markdown('<div class="diagnosis-label">SEVERITY LEVEL:</div>', unsafe_allow_html=True)
-                st.markdown(f'<div class="{sev_color_class}">{r_sev["label"]} ({r_sev["conf"]:.2f}%)</div>', unsafe_allow_html=True)
-                
-                st.markdown("<br>", unsafe_allow_html=True)
-                
-                # -- Action Buttons --
-                # 1. Download Report (Placeholder)
-                st.download_button(
-                    label="⬇️ Download PDF Report",
-                    data=f"Report for {r_res['label']}, {r_sev['label']}",
-                    file_name="lung_scan_report.txt",
-                    mime="text/plain",
-                    use_container_width=True,
-                    type="primary" # Makes it green usually in Streamlit default theme or custom theme
-                )
-                
-                # 2. Upload New (Reset)
-                if st.button("⬆️ Upload New Scan", use_container_width=True):
-                    # Clear state to reset
-                    for key in list(st.session_state.keys()):
-                        del st.session_state[key]
-                    st.rerun()
+                sev_color_class = "diagnosis-value-red" if sev_is_malignant else ("diagnosis-value-green" if sev_is_normal or sev_is_benign else "diagnosis-value-green")
+                if sev_is_malignant: sev_css = "color:#c62828;"
+                elif sev_is_normal or sev_is_benign: sev_css = "color:#2e7d32;"
+                else: sev_css = "color:#333;"
+
+                with c1:
+                    st.markdown(f"""
+                    <div class="model-card resnet">
+                        <div class="model-name">🔍 Visual Detection (ResNet50)</div>
+                        <div style="font-size:1.1rem; font-weight:bold; {res_css}">{r_res['label']}</div>
+                        <div style="color:#666; font-size:0.8rem;">Conf: {r_res['conf']:.1f}%</div>
+                    </div>
+                    """, unsafe_allow_html=True)
                     
-            else:
-                st.error("Analysis Failed")
-                st.write(results)
+                with c2:
+                     st.markdown(f"""
+                    <div class="model-card severity">
+                        <div class="model-name">⚖️ Severity Analysis</div>
+                        <div style="font-size:1.1rem; font-weight:bold; {sev_css}">{r_sev['label']}</div>
+                        <div style="color:#666; font-size:0.8rem;">Conf: {r_sev['conf']:.1f}%</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                
+                # Detailed Probabilities
+                with st.expander("📊 View Detailed Probabilities"):
+                    st.write("**Visual Detection Model Probabilities:**")
+                    st.bar_chart({lbl: float(r_res['scores'][i]) for i, lbl in enumerate(r_res['classes'])})
+                    
+                    st.write("**Severity Analysis Model Probabilities:**")
+                    st.bar_chart({lbl: float(r_sev['scores'][i]) for i, lbl in enumerate(r_sev['classes'])})
 
-        st.markdown('</div>', unsafe_allow_html=True) # End results-container
+            else:
+                st.error("One or more models failed to execute.")
+                if not results["ResNet50"]["success"]:
+                    st.error(f"ResNet Error: {results['ResNet50'].get('error')}")
+                if not results["Severity"]["success"]:
+                    st.error(f"Severity Error: {results['Severity'].get('error')}")
 
 else:
-    # Empty State Footer (only visible when not in result mode)
+    # Empty State Footer
     st.markdown("""
     <div style="text-align: center; margin-top: 5rem; color: #888;">
         <small>Powered by Dual-Engine Architecture | 2026 Medical Research</small>
